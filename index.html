@@ -1,0 +1,601 @@
+<script>
+// ============================================================
+//  API CONFIG
+// ============================================================
+// 🚨 여기에 새로 배포한 GAS Web App URL을 입력하세요!
+const GAS_URL = "https://script.google.com/macros/s/YOUR_SCRIPT_ID/exec";
+
+// ── 통신 유틸리티 (CORS 우회를 위해 text/plain 사용) ──
+async function callApi(action, payload = {}) {
+  try {
+    const response = await fetch(GAS_URL, {
+      method: "POST",
+      redirect: "follow", // GAS의 302 리다이렉트 자동 처리
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ action, payload })
+    });
+    const json = await response.json();
+    if (json.error) throw new Error(json.error);
+    return json;
+  } catch (err) {
+    console.error("API Error:", err);
+    throw err;
+  }
+}
+
+// ============================================================
+//  STATE
+// ============================================================
+let samples      = [];
+let makers       = ['내가직접', '협력사A', '협력사B'];
+let requesters   = ['나', '사내', '고객사'];
+let editMakers   = [];
+let editReqs     = [];
+let makerFilters = { dash:'전체', cal:'전체', list:'전체' };
+let reqFilters   = { dash:'전체', list:'전체' };
+let calYear, calMonth, calSelected = null;
+let currentDetail = null;
+let prevView = 'dash';
+
+function localDateStr(d) {
+  const dt = d || new Date();
+  return `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+}
+
+// ============================================================
+//  INIT
+// ============================================================
+window.onload = () => {
+  const now = new Date();
+  calYear  = now.getFullYear();
+  calMonth = now.getMonth();
+  document.getElementById('f-reqdate').value = localDateStr(now);
+  loadData();
+};
+
+async function loadData() {
+  document.getElementById('dash-list').innerHTML = `<div class="loading"><svg class="spin" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 2a10 10 0 0 1 10 10"/></svg> 데이터 불러오는 중…</div>`;
+  
+  try {
+    // 3번 통신하던 것을 1번으로 최적화하여 렌더링 속도 극대화
+    const data = await callApi('initData');
+    if(data.makers && data.makers.length) makers = data.makers;
+    if(data.requesters && data.requesters.length) requesters = data.requesters;
+    if(data.samples) samples = data.samples;
+    
+    buildMakerFilters();
+    buildRequesterFilters();
+    buildMakerSelect();
+    buildRequesterSelect();
+    renderAll();
+  } catch (e) {
+    showToast('오류: ' + e.message);
+  }
+}
+
+function refreshAll() { loadData(); showToast('새로고침 완료'); }
+function renderAll()  { updateStats(); renderDash(); renderCalendar(); renderList(); }
+
+// ============================================================
+//  NAVIGATION (이하 원본 코드 유지)
+// ============================================================
+function switchView(view, el) {
+  if (view === '_add') return;
+  if (view === 'settings' && currentViewId() !== 'settings') prevView = currentViewId();
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById('view-' + view).classList.add('active');
+  if (el) el.classList.add('active');
+  document.getElementById('view-area').scrollTop = 0;
+  if (view === 'settings') renderSettingsPage();
+}
+
+function currentViewId() {
+  const active = document.querySelector('.view.active');
+  return active ? active.id.replace('view-', '') : 'dash';
+}
+
+function buildMakerFilters() {
+  ['dash','cal','list'].forEach(v => {
+    const el = document.getElementById(v + '-maker-filter');
+    if (!el) return;
+    el.innerHTML = '';
+    ['전체', ...makers].forEach(m => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'mf-btn' + (makerFilters[v] === m ? ' active' : '');
+      btn.textContent = m;
+      btn.addEventListener('click', () => setMakerFilter(v, m));
+      el.appendChild(btn);
+    });
+  });
+}
+
+function buildRequesterFilters() {
+  ['dash','list'].forEach(v => {
+    const el = document.getElementById(v + '-req-filter');
+    if (!el) return;
+    el.innerHTML = '';
+    ['전체', ...requesters].forEach(r => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'mf-btn' + (reqFilters[v] === r ? ' active' : '');
+      btn.textContent = r;
+      btn.addEventListener('click', () => setRequesterFilter(v, r));
+      el.appendChild(btn);
+    });
+  });
+}
+
+function buildRequesterSelect() {
+  const sel = document.getElementById('f-requester');
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">선택 안 함</option>';
+  requesters.forEach(r => {
+    const opt = document.createElement('option');
+    opt.value = opt.textContent = r;
+    sel.appendChild(opt);
+  });
+  sel.value = cur;
+}
+
+function setMakerFilter(view, maker) {
+  makerFilters[view] = maker;
+  document.querySelectorAll('#' + view + '-maker-filter .mf-btn')
+    .forEach(b => b.classList.toggle('active', b.textContent.trim() === maker.trim()));
+  if (view === 'dash') { updateStats(); renderDash(); showToast(maker === '전체' ? '전체 보기' : maker + ' 필터 적용'); }
+  if (view === 'cal')  { renderCalendar(); if (calSelected) renderDayItems(calSelected); }
+  if (view === 'list') renderList();
+}
+
+function setRequesterFilter(view, req) {
+  reqFilters[view] = req;
+  document.querySelectorAll('#' + view + '-req-filter .mf-btn')
+    .forEach(b => b.classList.toggle('active', b.textContent.trim() === req.trim()));
+  if (view === 'dash') { updateStats(); renderDash(); showToast(req === '전체' ? '전체 보기' : req + ' 필터 적용'); }
+  if (view === 'list') renderList();
+}
+
+function buildMakerSelect() {
+  const sel = document.getElementById('f-maker');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">선택</option>';
+  makers.forEach(m => {
+    const opt = document.createElement('option');
+    opt.value = opt.textContent = m;
+    sel.appendChild(opt);
+  });
+  sel.value = cur;
+}
+
+function filteredSamples(view) {
+  let list = samples;
+  const mk = (makerFilters[view] || '전체').trim();
+  const rq = (reqFilters[view]   || '전체').trim();
+  if (mk !== '전체') list = list.filter(s => (s.maker || '').trim() === mk);
+  if (rq !== '전체') list = list.filter(s => (s.requester || '').trim() === rq);
+  return list;
+}
+
+function renderSettingsPage() {
+  editMakers = [...makers];
+  editReqs   = [...requesters];
+  renderMakerEditList();
+  renderReqEditList();
+}
+
+function renderMakerEditList() {
+  const el = document.getElementById('makers-edit-list');
+  if (!editMakers.length) {
+    el.innerHTML = '<p style="color:var(--sub);font-size:13px;padding:8px 0">제작주체가 없습니다.</p>';
+    return;
+  }
+  el.innerHTML = editMakers.map((m, i) => `
+    <div class="settings-row" id="sr-${i}">
+      <div class="sr-label" id="sr-label-${i}" onclick="startEditMaker(${i})">${esc(m)}</div>
+      <div class="sr-actions">
+        <div class="sr-btn" onclick="startEditMaker(${i})" title="이름 변경">✎</div>
+        <div class="sr-btn" onclick="moveMaker(${i},-1)" ${i===0?'style="opacity:.3;pointer-events:none"':''}>↑</div>
+        <div class="sr-btn" onclick="moveMaker(${i},1)" ${i===editMakers.length-1?'style="opacity:.3;pointer-events:none"':''}>↓</div>
+        <div class="sr-btn del" onclick="removeMaker(${i})" title="삭제">✕</div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function startEditMaker(i) {
+  const labelEl = document.getElementById('sr-label-' + i);
+  const cur = editMakers[i];
+  labelEl.innerHTML = `<input type="text" class="form-input" value="${esc(cur)}" id="inline-edit-${i}"
+    style="padding:6px 10px;font-size:14px;"
+    onblur="commitEditMaker(${i})" onkeydown="if(event.key==='Enter')this.blur(); if(event.key==='Escape'){this.value='${esc(cur)}';this.blur();}">`;
+  document.getElementById('inline-edit-' + i).focus();
+}
+function commitEditMaker(i) {
+  const inp = document.getElementById('inline-edit-' + i);
+  if (!inp) return;
+  const val = inp.value.trim();
+  if (val) editMakers[i] = val;
+  renderMakerEditList();
+}
+function addMakerRow() {
+  const val = document.getElementById('new-maker-input').value.trim();
+  if (!val) return showToast('이름을 입력해 주세요');
+  if (editMakers.includes(val)) return showToast('이미 존재하는 이름입니다');
+  editMakers.push(val);
+  document.getElementById('new-maker-input').value = '';
+  renderMakerEditList();
+}
+function removeMaker(i) {
+  if (editMakers.length <= 1) return showToast('최소 1개는 유지해야 합니다');
+  editMakers.splice(i, 1);
+  renderMakerEditList();
+}
+function moveMaker(i, dir) {
+  const j = i + dir;
+  if (j < 0 || j >= editMakers.length) return;
+  [editMakers[i], editMakers[j]] = [editMakers[j], editMakers[i]];
+  renderMakerEditList();
+}
+
+async function saveMakersToSheet() {
+  if (!editMakers.length) return showToast('제작주체가 없습니다');
+  showToast('저장 중…');
+  try {
+    await callApi('saveMakers', editMakers);
+    makers = [...editMakers];
+    makerFilters = { dash: '전체', cal: '전체', list: '전체' };
+    buildMakerFilters();
+    buildMakerSelect();
+    showToast('✅ 저장 완료!');
+  } catch(e) { showToast('오류: ' + e.message); }
+}
+
+function renderReqEditList() {
+  const el = document.getElementById('reqs-edit-list');
+  if (!editReqs.length) { el.innerHTML = '<p style="color:var(--sub);font-size:13px;padding:8px 0">요청자가 없습니다.</p>'; return; }
+  el.innerHTML = editReqs.map((r, i) => `
+    <div class="settings-row" id="rr-${i}">
+      <div class="sr-label" id="rr-label-${i}" onclick="startEditReq(${i})">${esc(r)}</div>
+      <div class="sr-actions">
+        <div class="sr-btn" onclick="startEditReq(${i})">✎</div>
+        <div class="sr-btn" onclick="moveReq(${i},-1)" ${i===0?'style="opacity:.3;pointer-events:none"':''}>↑</div>
+        <div class="sr-btn" onclick="moveReq(${i},1)" ${i===editReqs.length-1?'style="opacity:.3;pointer-events:none"':''}>↓</div>
+        <div class="sr-btn del" onclick="removeReq(${i})">✕</div>
+      </div>
+    </div>`).join('');
+}
+function startEditReq(i) {
+  const labelEl = document.getElementById('rr-label-' + i);
+  const cur = editReqs[i];
+  labelEl.innerHTML = `<input type="text" class="form-input" value="${esc(cur)}" id="rr-edit-${i}"
+    style="padding:6px 10px;font-size:14px;"
+    onblur="commitEditReq(${i})" onkeydown="if(event.key==='Enter')this.blur();">`;
+  document.getElementById('rr-edit-' + i).focus();
+}
+function commitEditReq(i) {
+  const inp = document.getElementById('rr-edit-' + i);
+  if (!inp) return;
+  const val = inp.value.trim();
+  if (val) editReqs[i] = val;
+  renderReqEditList();
+}
+function addReqRow() {
+  const val = document.getElementById('new-req-input').value.trim();
+  if (!val) return showToast('이름을 입력해 주세요');
+  if (editReqs.includes(val)) return showToast('이미 존재하는 이름입니다');
+  editReqs.push(val);
+  document.getElementById('new-req-input').value = '';
+  renderReqEditList();
+}
+function removeReq(i) {
+  if (editReqs.length <= 1) return showToast('최소 1개는 유지해야 합니다');
+  editReqs.splice(i, 1);
+  renderReqEditList();
+}
+function moveReq(i, dir) {
+  const j = i + dir;
+  if (j < 0 || j >= editReqs.length) return;
+  [editReqs[i], editReqs[j]] = [editReqs[j], editReqs[i]];
+  renderReqEditList();
+}
+
+async function saveRequestersToSheet() {
+  if (!editReqs.length) return showToast('요청자가 없습니다');
+  showToast('저장 중…');
+  try {
+    await callApi('saveRequesters', editReqs);
+    requesters = [...editReqs];
+    reqFilters = { dash: '전체', list: '전체' };
+    buildRequesterFilters();
+    buildRequesterSelect();
+    showToast('✅ 저장 완료!');
+  } catch (e) { showToast('오류: ' + e.message); }
+}
+
+function updateStats() {
+  const list  = filteredSamples('dash');
+  const total = list.length;
+  const delay = list.filter(s => s.isDelayed).length;
+  const done  = list.filter(s => s.isComplete).length;
+  document.getElementById('stat-total').textContent = total;
+  document.getElementById('stat-delay').textContent = delay;
+  document.getElementById('stat-prog').textContent  = total - delay - done;
+  document.getElementById('stat-done').textContent  = done;
+}
+
+function renderDash() {
+  const list = filteredSamples('dash');
+  document.getElementById('dash-list').innerHTML = list.length ? list.map(sampleCardHTML).join('') : emptyHTML('📦','등록된 샘플이 없습니다');
+}
+
+function renderList() {
+  const q = (document.getElementById('search-input').value || '').toLowerCase();
+  let list = filteredSamples('list');
+  if (q) list = list.filter(s => s.itemName.toLowerCase().includes(q) || s.purpose.toLowerCase().includes(q));
+  document.getElementById('list-area').innerHTML = list.length ? list.map(sampleCardHTML).join('') : emptyHTML('🔍','해당 항목이 없습니다');
+}
+
+function sampleCardHTML(s) {
+  const badge = s.isDelayed ? `<span class="sc-badge badge-delay">지연</span>`
+              : s.isComplete ? `<span class="sc-badge badge-done">완료</span>`
+              : `<span class="sc-badge badge-prog">진행중</span>`;
+  const dlClass = !s.deadline ? 'dl-none' : s.isDelayed ? 'dl-urgent'
+                : s.daysLeft <= 3 ? 'dl-urgent' : s.daysLeft <= 7 ? 'dl-soon' : 'dl-ok';
+  const dlText = !s.deadline ? '마감 미설정'
+               : s.isDelayed ? `D+${Math.abs(s.daysLeft)} 지연`
+               : s.daysLeft === 0 ? 'D-Day' : `D-${s.daysLeft}`;
+  const mi = makers.indexOf(s.maker);
+  const mc = mi >= 0 ? 'maker-' + mi : 'maker-0';
+  const steps = getSteps(s);
+  const dots = steps.map(st => `<div class="progress-dot${st.done?' done':''}"></div>`).join('');
+  return `<div class="sample-card${s.isDelayed?' delayed':''}${s.isComplete?' complete':''}" onclick="openDetail('${s.id}')">
+    <div class="sc-top"><div class="sc-name">${esc(s.itemName)}</div>${badge}</div>
+    <div class="sc-meta">
+      <span><span class="maker-tag ${mc}">${esc(s.maker)}</span></span>
+      ${s.requester ? `<span class="req-tag">${esc(s.requester)}</span>` : ''}
+      ${s.quantity ? `<span>📦 ${s.quantity}개</span>` : ''}
+      <span class="${dlClass}">🗓 ${dlText}${s.deadline ? ` (${s.deadline})` : ''}</span>
+    </div>
+    <div class="progress-track">${dots}</div>
+    <div style="font-size:10px;color:var(--sub);margin-top:4px">${steps.filter(st=>st.done).length}/${steps.length} 단계 완료</div>
+  </div>`;
+}
+
+function getSteps(s) {
+  const steps = [
+    { key:'sampleMade',    label:'샘플 제작 완료', done: s.sampleMade },
+    { key:'received',      label:'입수 완료',       done: s.received },
+    { key:'deptDelivered', label:'부서 전달 완료',  done: s.deptDelivered },
+  ];
+  if (s.poNeeded) {
+    steps.push({ key:'poDone',        label:'구매요청 완료', done: s.poDone });
+    steps.push({ key:'stockReceived', label:'입고 완료',     done: s.stockReceived });
+  }
+  steps.push({ key:'finalDelivered', label:'최종 전달 완료', done: s.finalDelivered });
+  return steps;
+}
+
+function openDetail(id) {
+  currentDetail = samples.find(x => x.id === id);
+  if (!currentDetail) return;
+  document.getElementById('detail-title').textContent = currentDetail.itemName;
+  renderDetailBody(currentDetail);
+  openSheet('detail-sheet');
+}
+
+function renderDetailBody(s) {
+  const mi = makers.indexOf(s.maker);
+  const mc = mi >= 0 ? 'maker-' + mi : 'maker-0';
+  const steps = getSteps(s);
+  const stepsHTML = steps.map(st => {
+    const showPoInput = st.key === 'poDone';
+    const isLocked = st.key === 'stockReceived' && !s.poDone;
+    return `<div class="step-row${isLocked ? ' step-locked' : ''}">
+      <div class="step-check${st.done?' done':''}${isLocked?' locked':''}"
+        onclick="${isLocked ? 'showToast(\'구매요청 완료 후 체크 가능합니다\')' : `toggleStep('${st.key}',${!st.done})`}"></div>
+      <div style="flex:1">
+        <div class="step-label${isLocked ? ' step-label-dim' : ''}">${st.label}${isLocked ? ' <span style="font-size:10px;color:var(--sub2)">(구매요청 완료 필요)</span>' : ''}</div>
+        ${showPoInput && (s.poDone || s.poNumber) ? `<input class="step-po-input" id="po-num-input" placeholder="구매요청번호 입력" value="${esc(s.poNumber)}" onchange="savePoNumber(this.value)">` : ''}
+      </div>
+    </div>`;
+  }).join('');
+
+  const dlClass = !s.deadline ? 'dl-none' : s.isDelayed ? 'dl-urgent' : s.daysLeft <= 3 ? 'dl-urgent' : s.daysLeft <= 7 ? 'dl-soon' : 'dl-ok';
+
+  document.getElementById('detail-body').innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+      <span class="maker-tag ${mc}">${esc(s.maker)}</span>
+      ${s.isDelayed ? `<span class="sc-badge badge-delay">지연</span>` : s.isComplete ? `<span class="sc-badge badge-done">완료</span>` : `<span class="sc-badge badge-prog">진행중</span>`}
+    </div>
+    <div style="font-size:13px;color:var(--sub);display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px">
+      ${s.quantity ? `<span>수량: <b style="color:var(--text)">${s.quantity}개</b></span>` : ''}
+      ${s.purpose ? `<span>용도: <b style="color:var(--text)">${esc(s.purpose)}</b></span>` : ''}
+      ${s.requester ? `<span>요청자: <b style="color:var(--text)">${esc(s.requester)}</b></span>` : ''}
+      ${s.requestDate ? `<span>요청일: <b style="color:var(--text)">${s.requestDate}</b></span>` : ''}
+    </div>
+    ${s.deadline ? `<div style="background:var(--bg3);border:1px solid var(--border);border-radius:12px;padding:12px 16px;margin-bottom:12px">
+      <div style="font-size:11px;color:var(--sub);margin-bottom:2px">마감기한</div>
+      <div class="${dlClass}" style="font-size:18px;font-weight:700">${s.deadline}
+        <span style="font-size:13px;font-weight:400"> · ${s.isDelayed?'D+'+Math.abs(s.daysLeft)+' 지연':s.daysLeft===0?'D-Day':'D-'+s.daysLeft}</span>
+      </div></div>` : ''}
+    <div class="detail-section-title">진행 단계</div>
+    <div style="background:var(--bg3);border:1px solid var(--border);border-radius:12px;padding:0 16px"><div class="status-steps">${stepsHTML}</div></div>
+    ${s.notes ? `<div class="detail-section-title">비고</div><div style="background:var(--bg3);border:1px solid var(--border);border-radius:12px;padding:12px 16px;font-size:14px;color:var(--sub)">${esc(s.notes)}</div>` : ''}
+    <div style="margin-top:16px;font-size:11px;color:var(--sub2);text-align:center">ID: ${s.id}</div>
+  `;
+}
+
+async function toggleStep(field, value) {
+  if (!currentDetail) return;
+  if (field === 'poDone' && value) {
+    const inp = document.getElementById('po-num-input');
+    if (inp) currentDetail.poNumber = inp.value;
+  }
+  currentDetail[field] = value;
+  
+  // 상태 업데이트 및 화면 리렌더링 (Optimistic UI)
+  const today = new Date(); today.setHours(0,0,0,0);
+  const dl = currentDetail.deadline ? new Date(currentDetail.deadline) : null;
+  if (dl) dl.setHours(0,0,0,0);
+  currentDetail.isDelayed  = !currentDetail.finalDelivered && dl && dl < today;
+  currentDetail.isComplete = currentDetail.finalDelivered;
+  const idx = samples.findIndex(x => x.id === currentDetail.id);
+  if (idx >= 0) samples[idx] = { ...currentDetail };
+  renderDetailBody(currentDetail);
+  renderAll();
+
+  try {
+    await callApi('toggleField', { id: currentDetail.id, field, value });
+    showToast('저장됨');
+  } catch (e) {
+    showToast('오류: ' + e.message);
+  }
+}
+
+async function savePoNumber(val) {
+  if (!currentDetail) return;
+  currentDetail.poNumber = val;
+  try {
+    await callApi('toggleField', { id: currentDetail.id, field: 'poNumber', value: val });
+    showToast('번호 저장됨');
+  } catch(e) {}
+}
+
+function openAddSheet() {
+  currentDetail = null;
+  document.getElementById('form-title').textContent = '새 샘플 추가';
+  document.getElementById('form-delete-btn').style.display = 'none';
+  clearForm();
+  document.getElementById('f-reqdate').value = localDateStr();
+  document.getElementById('f-requester').value = '';
+  openSheet('form-sheet');
+}
+
+function editCurrent() {
+  if (!currentDetail) return;
+  closeSheet();
+  setTimeout(() => {
+    const s = currentDetail;
+    document.getElementById('form-title').textContent = '샘플 편집';
+    document.getElementById('form-delete-btn').style.display = '';
+    document.getElementById('f-id').value      = s.id;
+    document.getElementById('f-name').value    = s.itemName;
+    document.getElementById('f-qty').value     = s.quantity;
+    document.getElementById('f-purpose').value = s.purpose;
+    document.getElementById('f-maker').value   = s.maker;
+    document.getElementById('f-reqdate').value = s.requestDate;
+    document.getElementById('f-deadline').value= s.deadline;
+    document.getElementById('f-notes').value   = s.notes;
+    document.getElementById('f-requester').value = s.requester || '';
+    document.getElementById(s.poNeeded ? 'f-po-y' : 'f-po-n').checked = true;
+    openSheet('form-sheet');
+  }, 200);
+}
+
+function clearForm() {
+  ['f-id','f-name','f-qty','f-purpose','f-deadline','f-notes','f-requester'].forEach(id => document.getElementById(id).value = '');
+  document.getElementById('f-maker').value = '';
+  document.getElementById('f-po-n').checked = true;
+}
+
+async function saveSample() {
+  const name  = document.getElementById('f-name').value.trim();
+  const maker = document.getElementById('f-maker').value;
+  if (!name)  return showToast('품목명을 입력해 주세요');
+  if (!maker) return showToast('제작주체를 선택해 주세요');
+
+  const id = document.getElementById('f-id').value;
+  const data = {
+    id, itemName: name, quantity: document.getElementById('f-qty').value || '',
+    purpose: document.getElementById('f-purpose').value.trim(), maker,
+    requestDate: document.getElementById('f-reqdate').value,
+    deadline: document.getElementById('f-deadline').value,
+    requester: document.getElementById('f-requester').value,
+    poNeeded: document.getElementById('f-po-y').checked,
+    notes: document.getElementById('f-notes').value.trim(),
+    ...(id && currentDetail ? {
+      sampleMade: currentDetail.sampleMade, received: currentDetail.received,
+      deptDelivered: currentDetail.deptDelivered, poDone: currentDetail.poDone,
+      poNumber: currentDetail.poNumber, stockReceived: currentDetail.stockReceived,
+      finalDelivered: currentDetail.finalDelivered
+    } : { sampleMade:false, received:false, deptDelivered:false, poDone:false, poNumber:'', stockReceived:false, finalDelivered:false })
+  };
+
+  closeSheet();
+  showToast('저장 중...');
+  try {
+    await callApi(id ? 'updateFullSample' : 'addSample', data);
+    showToast(id ? '수정 완료' : '추가 완료');
+    loadData();
+  } catch (e) { showToast('오류: ' + e.message); }
+}
+
+async function deleteCurrent() {
+  const id = document.getElementById('f-id').value;
+  if (!id || !confirm('이 항목을 삭제할까요?')) return;
+  closeSheet();
+  showToast('삭제 중...');
+  try {
+    await callApi('deleteSample', id);
+    showToast('삭제 완료');
+    loadData();
+  } catch (e) { showToast('오류: ' + e.message); }
+}
+
+function renderCalendar() {
+  document.getElementById('cal-month-label').textContent = `${calYear}년 ${calMonth + 1}월`;
+  const list = filteredSamples('cal');
+  const today = new Date(); today.setHours(0,0,0,0);
+  const dateMap = {};
+  list.forEach(s => { if (!s.deadline) return; if (!dateMap[s.deadline]) dateMap[s.deadline] = []; dateMap[s.deadline].push(s); });
+
+  const startDay = new Date(calYear, calMonth, 1).getDay();
+  const daysInMonth = new Date(calYear, calMonth + 1, 0).getDate();
+  const prevDays = new Date(calYear, calMonth, 0).getDate();
+  const todayStr = localDateStr(today);
+  let html = '';
+  const total = startDay + daysInMonth;
+  const cells = total + (7 - (total % 7 === 0 ? 7 : total % 7));
+
+  for (let i = 0; i < cells; i++) {
+    let day, mo = calMonth, yr = calYear, cls = '';
+    if (i < startDay) { day = prevDays - startDay + i + 1; cls = 'other'; mo--; if (mo < 0) { mo = 11; yr--; } }
+    else if (i >= startDay + daysInMonth) { day = i - startDay - daysInMonth + 1; cls = 'other'; mo++; if (mo > 11) { mo = 0; yr++; } }
+    else { day = i - startDay + 1; }
+    const dateStr = `${yr}-${String(mo+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+    if (dateStr === todayStr) cls += ' today';
+    if (dateStr === calSelected) cls += ' selected';
+    const items = dateMap[dateStr] || [];
+    const dots = items.slice(0,3).map(s => `<div class="day-dot ${s.isDelayed?'dot-delay':s.isComplete?'dot-done':'dot-prog'}"></div>`).join('');
+    html += `<div class="cal-day ${cls}" onclick="calSelectDay('${dateStr}')"><div class="day-num">${day}</div>${items.length ? `<div class="day-dots">${dots}</div>` : ''}</div>`;
+  }
+  document.getElementById('cal-days').innerHTML = html;
+  if (calSelected) renderDayItems(calSelected);
+}
+
+function renderDayItems(dateStr) {
+  const list = filteredSamples('cal').filter(s => s.deadline === dateStr);
+  document.getElementById('cal-day-items').innerHTML = list.length
+    ? `<div class="cal-day-label">${dateStr} (${list.length}건)</div>` + list.map(sampleCardHTML).join('')
+    : `<div class="cal-day-label">${dateStr} — 마감 항목 없음</div>`;
+}
+
+function calSelectDay(d) { calSelected = d; renderCalendar(); }
+function calPrev() { calMonth--; if (calMonth < 0) { calMonth = 11; calYear--; } calSelected = null; renderCalendar(); }
+function calNext() { calMonth++; if (calMonth > 11) { calMonth = 0; calYear++; } calSelected = null; renderCalendar(); }
+
+function openSheet(id) { document.getElementById('overlay').classList.add('show'); document.getElementById(id).classList.add('show'); }
+function closeSheet()  { document.getElementById('overlay').classList.remove('show'); document.querySelectorAll('.bottom-sheet').forEach(s => s.classList.remove('show')); }
+function esc(str)      { return String(str||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+function emptyHTML(icon, msg) { return `<div class="empty"><div class="empty-icon">${icon}</div><p>${msg}</p></div>`; }
+
+let _toastTimer;
+function showToast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg; el.classList.add('show');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
+}
+</script>
